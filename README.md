@@ -6,14 +6,6 @@
 
 🏆 Proyecto presentado en **Expo Software 2026** — Escuela de Ingeniería Informática, Pontificia Universidad Católica de Valparaíso (PUCV).
 
----
-
-## 📌 Descripción corta (para GitHub "About")
-
-> Plataforma web que evalúa tu hardware, simula la ejecución de modelos de IA locales y te guía paso a paso para instalarlos — sin nube, sin terminal, sin adivinar.
-
----
-
 ## 🧩 El problema
 
 Correr modelos de IA de forma local es hoy territorio casi exclusivo de usuarios técnicos. Requiere entender conceptos como VRAM, cuantización, backends de inferencia y configuración por terminal.
