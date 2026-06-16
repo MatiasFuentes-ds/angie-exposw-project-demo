@@ -9,68 +9,131 @@ from logic.evaluacion import evaluar_modelo, VERDE, AMARILLO, ROJO
 
 # ── Constantes del modelo de simulación ───────────────────────────────────────
 
-# Factor de penalización de velocidad cuando el modelo corre solo en CPU.
-# Benchmarks reales de Ollama muestran ~4-6× más lento en CPU vs GPU dedicada.
-FACTOR_PENALIZACION_CPU = 0.22
-
-# La RAM del sistema operativo + procesos base ocupa aprox. un 20-25% antes de cargar el modelo.
+# Overhead del SO + procesos base antes de cargar el modelo (GB).
 OVERHEAD_SO_GB = 2.5
+
+# Overhead de KV Cache por cada 1k de tokens de contexto (GB).
+# Estimación: ~0.1 GB/1k tokens para modelos 7B-8B en Q4; escala con el tamaño del modelo.
+OVERHEAD_KV_CACHE_POR_1K_GB = 0.1
+
+# Ancho de banda de disco asumido: SSD NVMe estándar (GB/s).
+# Fuente: Samsung 970 Evo / WD Black SN770 → ~2.5 GB/s lectura secuencial.
+ANCHO_BANDA_DISCO_GB_S = 2.5
+
+# Factor de penalización por swapping: si la RAM está al límite, el sistema
+# pagina al disco y la carga se ralentiza drásticamente.
+FACTOR_SWAP_PENALIZACION = 3.5
+
+# Umbral de uso de RAM a partir del cual se activa el swapping (%).
+UMBRAL_RAM_SWAP = 88
 
 # Temperatura base de CPU bajo carga sostenida de inferencia (°C).
 TEMP_BASE_CPU = 62
 
-# Temperatura base de GPU bajo inferencia (°C).
+# Temperatura base de GPU / Neural Engine bajo inferencia (°C).
 TEMP_BASE_GPU = 58
+
+# Temperatura base de Apple Silicon bajo carga (°C). Menor que GPU discreta
+# por el diseño de TDP del SoC en sistemas M-series.
+TEMP_BASE_APPLE_SILICON = 52
 
 # Umbral de uso de RAM para considerar que el sistema está "al límite" (%).
 UMBRAL_RAM_CRITICA = 85
+
+
+# ── Helper: detección de paradigma de ejecución ───────────────────────────────
+
+def _detectar_modo_gpu(modelo: dict, specs: dict) -> tuple[bool, bool]:
+    """
+    Determina si hay aceleración GPU activa y si es memoria unificada (Apple Silicon).
+
+    Retorna
+    -------
+    (gpu_activa: bool, es_apple_silicon: bool)
+
+    Lógica de memoria unificada:
+        En macOS (Apple M-series), la RAM del sistema ES la VRAM.
+        No se necesita GPU discreta: si ram_gb >= vram_min_gb del modelo,
+        se considera que el Neural Engine / GPU integrada puede acelerar la inferencia.
+    """
+    so = specs.get("sistema_operativo", "")
+    ram_usuario  = specs.get("ram_gb", 0)
+    tiene_gpu    = specs.get("tiene_gpu", False)
+    vram_usuario = specs.get("vram_gb", 0)
+    vram_requerida = modelo["vram_min_gb"]
+
+    es_apple_silicon = (so == "macOS")
+
+    if es_apple_silicon:
+        # Memoria unificada: la RAM actúa como VRAM
+        gpu_activa = ram_usuario >= vram_requerida
+    else:
+        # GPU discreta tradicional
+        gpu_activa = tiene_gpu and vram_usuario >= vram_requerida
+
+    return gpu_activa, es_apple_silicon
 
 
 # ── Funciones de cálculo ──────────────────────────────────────────────────────
 
 def _calcular_tokens_por_segundo(modelo: dict, specs: dict) -> float:
     """
-    Estima tokens/seg basándose en:
-    - La velocidad base del modelo (calibrada para un equipo con 16 GB RAM, sin GPU).
-    - Un factor de escala según la RAM disponible: más RAM → menos swapping → más velocidad.
-    - Si tiene GPU con VRAM suficiente, se aplica un boost multiplicativo.
+    Estima tokens/seg usando el factor_aceleracion_gpu empírico del modelo.
 
     Fórmula:
-        factor_ram = min(ram_usuario / (ram_requerida * 1.5), 1.5)
-        tps = base * factor_ram  [sin GPU]
-        tps = base * factor_ram / FACTOR_PENALIZACION_CPU  [con GPU suficiente]
+        CPU puro:
+            factor_ram = min(ram_usuario / (ram_min * 1.5), 1.5)
+            tps = tokens_por_seg_base * factor_ram
+
+        Con GPU activa (discreta o Apple Silicon):
+            tps = tokens_por_seg_base * factor_aceleracion_gpu
+
+        Apple Silicon aplica el mismo factor_aceleracion_gpu porque el Neural Engine
+        de los chips M-series tiene rendimiento comparable a una GPU de consumo medio
+        (RTX 3060/4060) para cargas de inferencia Q4.
+
+    No se usa un FACTOR_PENALIZACION_CPU global: la velocidad GPU se deriva
+    directamente del multiplicador empírico registrado por modelo.
     """
-    base = modelo["tokens_por_seg_base"]
-    ram_usuario   = specs.get("ram_gb", 8)
-    ram_requerida = modelo["ram_min_gb"]
-    tiene_gpu     = specs.get("tiene_gpu", False)
-    vram_usuario  = specs.get("vram_gb", 0)
-    vram_requerida = modelo["vram_min_gb"]
+    base              = modelo["tokens_por_seg_base"]
+    factor_gpu        = modelo["factor_aceleracion_gpu"]
+    ram_usuario       = specs.get("ram_gb", 8)
+    ram_requerida     = modelo["ram_min_gb"]
 
-    factor_ram = min(ram_usuario / max(ram_requerida * 1.5, 1), 1.5)
-    tps = base * factor_ram
+    gpu_activa, _ = _detectar_modo_gpu(modelo, specs)
 
-    if tiene_gpu and vram_requerida > 0 and vram_usuario >= vram_requerida:
-        tps = tps / FACTOR_PENALIZACION_CPU
+    if gpu_activa:
+        tps = base * factor_gpu
+    else:
+        factor_ram = min(ram_usuario / max(ram_requerida * 1.5, 1), 1.5)
+        tps = base * factor_ram
 
-    return round(min(tps, base * 3.0), 1)  # techo: 3× la base para no exagerar
+    return round(tps, 1)
 
 
 def _calcular_uso_ram_pct(modelo: dict, specs: dict) -> float:
     """
-    Estima el porcentaje de RAM del sistema que consumirá el modelo.
+    Estima el porcentaje de RAM del sistema que consumirá el modelo,
+    incluyendo el overhead dinámico del KV Cache según la ventana de contexto.
 
     Fórmula:
-        ram_consumida = ram_requerida_modelo + OVERHEAD_SO
-        uso_pct = (ram_consumida / ram_total) * 100
+        ram_modelo_gb   = peso_archivo_gb                    (peso real del archivo cuantizado)
+        overhead_so_gb  = OVERHEAD_SO_GB                     (~2.5 GB para OS + procesos base)
+        overhead_kv_gb  = contexto_max_k * 0.1               (0.1 GB por cada 1k tokens de contexto)
+        ram_consumida   = ram_modelo_gb + overhead_so_gb + overhead_kv_gb
+        uso_pct         = (ram_consumida / ram_total) * 100
 
-    El overhead del SO representa los ~2.5 GB que consume el sistema operativo
-    y procesos base antes de cargar el modelo.
+    Usar peso_archivo_gb en vez de ram_min_gb es más preciso:
+    refleja el footprint real del archivo .gguf en memoria, no el requisito mínimo
+    declarado por el fabricante (que puede subestimar el consumo real).
     """
-    ram_usuario   = specs.get("ram_gb", 8)
-    ram_requerida = modelo["ram_min_gb"]
+    ram_usuario    = specs.get("ram_gb", 8)
+    peso_gb        = modelo["peso_archivo_gb"]
+    contexto_k     = modelo["contexto_max_k"]
 
-    ram_consumida = ram_requerida + OVERHEAD_SO_GB
+    overhead_kv_gb = contexto_k * OVERHEAD_KV_CACHE_POR_1K_GB
+    ram_consumida  = peso_gb + OVERHEAD_SO_GB + overhead_kv_gb
+
     uso_pct = (ram_consumida / ram_usuario) * 100
     return round(min(uso_pct, 100.0), 1)
 
@@ -80,22 +143,23 @@ def _calcular_uso_cpu_pct(modelo: dict, specs: dict) -> float:
     Estima el uso de CPU durante la inferencia.
 
     Lógica:
-    - Sin GPU: el modelo corre enteramente en CPU → uso alto (55-95% según presión de RAM).
-    - Con GPU suficiente: la GPU asume la mayor parte → CPU solo coordina (~20-35%).
-    - La presión de RAM (uso_ram_pct) amplifica el trabajo del CPU por swapping.
+        - CPU puro: todo el cómputo cae en el procesador → uso alto (60-95%).
+        - GPU discreta activa: CPU solo coordina → uso bajo (20-35%).
+        - Apple Silicon: el Neural Engine asume la inferencia, CPU libre → uso bajo (15-25%).
+          Los chips M-series separan el Neural Engine del CPU, por eso el uso es menor
+          incluso que con una GPU discreta convencional.
 
-    Fórmula base:
-        uso_cpu_sin_gpu = 60 + (uso_ram_pct / 100) * 35   → rango 60-95%
-        uso_cpu_con_gpu = 20 + (uso_ram_pct / 100) * 15   → rango 20-35%
+    Fórmula:
+        uso_sin_gpu       = 60 + (uso_ram_pct / 100) * 35  → rango 60-95%
+        uso_con_gpu       = 20 + (uso_ram_pct / 100) * 15  → rango 20-35%
+        uso_apple_silicon = 15 + (uso_ram_pct / 100) * 10  → rango 15-25%
     """
-    tiene_gpu     = specs.get("tiene_gpu", False)
-    vram_usuario  = specs.get("vram_gb", 0)
-    vram_requerida = modelo["vram_min_gb"]
     uso_ram = _calcular_uso_ram_pct(modelo, specs)
+    gpu_activa, es_apple_silicon = _detectar_modo_gpu(modelo, specs)
 
-    gpu_activa = tiene_gpu and vram_requerida > 0 and vram_usuario >= vram_requerida
-
-    if gpu_activa:
+    if es_apple_silicon and gpu_activa:
+        uso_cpu = 15 + (uso_ram / 100) * 10
+    elif gpu_activa:
         uso_cpu = 20 + (uso_ram / 100) * 15
     else:
         uso_cpu = 60 + (uso_ram / 100) * 35
@@ -105,60 +169,70 @@ def _calcular_uso_cpu_pct(modelo: dict, specs: dict) -> float:
 
 def _calcular_tiempo_carga_seg(modelo: dict, specs: dict) -> float:
     """
-    Estima los segundos que tarda el modelo en cargar en memoria antes de la primera respuesta.
+    Estima los segundos para cargar el modelo en memoria antes de la primera respuesta.
+    El cálculo está anclado al peso físico del archivo, no a la cantidad de parámetros.
 
-    Lógica:
-    - El tiempo de carga escala con el tamaño del modelo (parámetros_b).
-    - Se reduce proporcionalmente si hay RAM holgada (menos fragmentación).
-    - Con GPU activa, la carga es significativamente más rápida.
+    Fórmula base (SSD NVMe, lectura secuencial):
+        t_base = peso_archivo_gb / ANCHO_BANDA_DISCO_GB_S
+               = peso_archivo_gb / 2.5   (GB/s de un NVMe estándar)
 
-    Fórmula:
-        t_base = parametros_b * 1.8  (segundos por cada 1B de parámetros en CPU medio)
-        factor_ram = max(ram_requerida / ram_usuario, 0.5)  (penaliza RAM ajustada)
-        t_final = t_base * factor_ram   [CPU]
-        t_final = t_base * factor_ram * 0.35  [GPU]
+    Penalización por swapping:
+        Si uso_ram_pct >= UMBRAL_RAM_SWAP, el sistema está paginando a disco.
+        La carga se multiplica por FACTOR_SWAP_PENALIZACION (3.5×) porque el
+        sistema operativo intercala lecturas del modelo con escrituras de swap,
+        degradando el ancho de banda efectivo de disco severamente.
+
+    Apple Silicon:
+        El controlador de memoria unificada tiene mayor ancho de banda interno
+        (~100 GB/s en M2/M3 vs ~3.5 GB/s de un NVMe externo), pero el modelo
+        igual se lee del disco SSD antes de cargarse en memoria.
+        Se aplica un factor 0.8× (10-20% más rápido) por el controlador de I/O
+        integrado en el SoC.
     """
-    parametros  = modelo["parametros_b"]
-    ram_usuario  = specs.get("ram_gb", 8)
-    ram_requerida = modelo["ram_min_gb"]
-    tiene_gpu    = specs.get("tiene_gpu", False)
-    vram_usuario = specs.get("vram_gb", 0)
-    vram_requerida = modelo["vram_min_gb"]
+    peso_gb       = modelo["peso_archivo_gb"]
+    uso_ram       = _calcular_uso_ram_pct(modelo, specs)
+    gpu_activa, es_apple_silicon = _detectar_modo_gpu(modelo, specs)
 
-    t_base = parametros * 1.8
-    factor_ram = max(ram_requerida / ram_usuario, 0.5)
-    t_carga = t_base * factor_ram
+    t_base = peso_gb / ANCHO_BANDA_DISCO_GB_S
 
-    gpu_activa = tiene_gpu and vram_requerida > 0 and vram_usuario >= vram_requerida
-    if gpu_activa:
-        t_carga *= 0.35
+    # Penalización por swapping
+    if uso_ram >= UMBRAL_RAM_SWAP:
+        t_base *= FACTOR_SWAP_PENALIZACION
 
-    return round(max(t_carga, 1.0), 1)  # mínimo 1 segundo
+    # Ligera ventaja de I/O en Apple Silicon
+    if es_apple_silicon:
+        t_base *= 0.8
+
+    return round(max(t_base, 0.5), 1)  # mínimo 0.5 s
 
 
 def _calcular_temperatura_c(modelo: dict, specs: dict) -> float:
     """
-    Estima la temperatura aproximada del componente principal durante inferencia sostenida.
+    Estima la temperatura del componente principal durante inferencia sostenida.
 
-    Lógica:
-    - Sin GPU: reporta temperatura de CPU. Sube con el porcentaje de uso de CPU.
-    - Con GPU activa: reporta temperatura de GPU. Sube con el uso de VRAM.
+    Lógica por modo de ejecución:
+        - CPU puro       → temperatura de CPU. Sube con % de uso de CPU.
+        - GPU discreta   → temperatura de GPU. Sube con ratio VRAM usada/disponible.
+        - Apple Silicon  → temperatura del SoC. Base más baja por TDP acotado (~15-30W).
+                           Sube con el uso de RAM (proxy de carga del Neural Engine).
 
-    Fórmula:
-        uso_cpu_pct = _calcular_uso_cpu_pct(...)
-        temp_cpu = TEMP_BASE + (uso_cpu_pct / 100) * 28   → rango ~62-90°C
-        temp_gpu = TEMP_BASE_GPU + (vram_usada / vram_total) * 30  → rango ~58-88°C
+    Fórmulas:
+        temp_cpu          = TEMP_BASE_CPU + (uso_cpu / 100) * 28     → ~62-90°C
+        temp_gpu_discreta = TEMP_BASE_GPU + (vram_ratio) * 30        → ~58-88°C
+        temp_apple_silicon = TEMP_BASE_APPLE_SILICON + (uso_ram / 100) * 22  → ~52-74°C
     """
-    tiene_gpu     = specs.get("tiene_gpu", False)
-    vram_usuario  = specs.get("vram_gb", 0)
+    gpu_activa, es_apple_silicon = _detectar_modo_gpu(modelo, specs)
+    uso_ram    = _calcular_uso_ram_pct(modelo, specs)
+    uso_cpu    = _calcular_uso_cpu_pct(modelo, specs)
+    vram_usuario   = specs.get("vram_gb", 0)
     vram_requerida = modelo["vram_min_gb"]
-    gpu_activa = tiene_gpu and vram_requerida > 0 and vram_usuario >= vram_requerida
 
-    if gpu_activa:
-        uso_vram_ratio = min(vram_requerida / vram_usuario, 1.0)
-        temp = TEMP_BASE_GPU + uso_vram_ratio * 30
+    if es_apple_silicon and gpu_activa:
+        temp = TEMP_BASE_APPLE_SILICON + (uso_ram / 100) * 22
+    elif gpu_activa:
+        vram_ratio = min(vram_requerida / max(vram_usuario, 1), 1.0)
+        temp = TEMP_BASE_GPU + vram_ratio * 30
     else:
-        uso_cpu = _calcular_uso_cpu_pct(modelo, specs)
         temp = TEMP_BASE_CPU + (uso_cpu / 100) * 28
 
     return round(min(temp, 95.0), 1)
@@ -169,18 +243,18 @@ def _generar_veredicto(uso_ram: float, tps: float, nivel_evaluacion: str) -> dic
     Genera el texto de veredicto reutilizando el nivel del semáforo de evaluacion.py
     para mantener consistencia entre el semáforo inicial y la simulación detallada.
 
-    Retorna dict con: titulo, descripcion, color_streamlit
+    Retorna dict con: titulo, descripcion, color
     """
     if nivel_evaluacion == ROJO:
         return {
-            "titulo": "⛔ No recomendado",
+            "titulo":      "⛔ No recomendado",
             "descripcion": "Tu equipo no cumple los requisitos mínimos. El modelo podría no iniciar o bloquearse.",
-            "color": "error",
+            "color":       "error",
         }
 
     if nivel_evaluacion == AMARILLO or uso_ram >= UMBRAL_RAM_CRITICA:
         return {
-            "titulo": "⚠️ Funciona al límite",
+            "titulo":      "⚠️ Funciona al límite",
             "descripcion": (
                 f"El modelo arrancará, pero con {uso_ram}% de uso de RAM y ~{tps} tok/s "
                 "el equipo estará bajo presión. No apto para uso continuo prolongado."
@@ -189,7 +263,7 @@ def _generar_veredicto(uso_ram: float, tps: float, nivel_evaluacion: str) -> dic
         }
 
     return {
-        "titulo": "✅ Funciona bien",
+        "titulo":      "✅ Funciona bien",
         "descripcion": (
             f"Tu equipo puede correr este modelo con comodidad (~{tps} tok/s). "
             "Uso de recursos dentro de rangos normales."
@@ -209,39 +283,37 @@ def simular(modelo_id: str, specs: dict) -> dict:
     modelo_id : str
         Clave del modelo tal como está definida en data/modelos.py.
     specs : dict
-        Hardware del usuario. Mismas claves que en evaluacion.py:
-            - ram_gb       (int)
-            - tiene_gpu    (bool)
-            - vram_gb      (int)
-            - uso_deseado  (str)
+        Hardware del usuario:
+            - ram_gb            (int)  : RAM total del sistema en GB
+            - tiene_gpu         (bool) : True si tiene GPU discreta (ignorado en macOS)
+            - vram_gb           (int)  : VRAM de GPU discreta (ignorado en macOS)
+            - uso_deseado       (str)  : caso de uso
+            - sistema_operativo (str)  : "Windows" | "macOS" | "Linux"
 
     Retorna
     -------
-    dict con las métricas listas para renderizar en app.py:
-        {
-            "tokens_por_segundo": float,   # velocidad de generación estimada
-            "uso_ram_pct":        float,   # % de RAM del sistema en uso
-            "uso_cpu_pct":        float,   # % de CPU durante inferencia
-            "tiempo_carga_seg":   float,   # segundos hasta primera respuesta
-            "temperatura_c":      float,   # °C del componente principal
-            "modo_ejecucion":     str,     # "GPU" | "CPU"
-            "veredicto":          dict,    # {titulo, descripcion, color}
-        }
+    dict con métricas listas para app.py:
+        tokens_por_segundo, uso_ram_pct, uso_cpu_pct, tiempo_carga_seg,
+        temperatura_c, modo_ejecucion, contexto_max_k, veredicto
     """
-    modelo = get_modelo(modelo_id)
+    modelo     = get_modelo(modelo_id)
     evaluacion = evaluar_modelo(modelo, specs)
 
-    tiene_gpu     = specs.get("tiene_gpu", False)
-    vram_usuario  = specs.get("vram_gb", 0)
-    vram_requerida = modelo["vram_min_gb"]
-    gpu_activa = tiene_gpu and vram_requerida > 0 and vram_usuario >= vram_requerida
+    gpu_activa, es_apple_silicon = _detectar_modo_gpu(modelo, specs)
 
-    tps       = _calcular_tokens_por_segundo(modelo, specs)
-    uso_ram   = _calcular_uso_ram_pct(modelo, specs)
-    uso_cpu   = _calcular_uso_cpu_pct(modelo, specs)
-    t_carga   = _calcular_tiempo_carga_seg(modelo, specs)
-    temp      = _calcular_temperatura_c(modelo, specs)
+    tps      = _calcular_tokens_por_segundo(modelo, specs)
+    uso_ram  = _calcular_uso_ram_pct(modelo, specs)
+    uso_cpu  = _calcular_uso_cpu_pct(modelo, specs)
+    t_carga  = _calcular_tiempo_carga_seg(modelo, specs)
+    temp     = _calcular_temperatura_c(modelo, specs)
     veredicto = _generar_veredicto(uso_ram, tps, evaluacion["nivel"])
+
+    if es_apple_silicon and gpu_activa:
+        modo = "Neural Engine 🍎"
+    elif gpu_activa:
+        modo = "GPU 🎮"
+    else:
+        modo = "CPU 🖥️"
 
     return {
         "tokens_por_segundo": tps,
@@ -249,7 +321,8 @@ def simular(modelo_id: str, specs: dict) -> dict:
         "uso_cpu_pct":        uso_cpu,
         "tiempo_carga_seg":   t_carga,
         "temperatura_c":      temp,
-        "modo_ejecucion":     "GPU 🎮" if gpu_activa else "CPU 🖥️",
+        "modo_ejecucion":     modo,
+        "contexto_max_k":     modelo["contexto_max_k"],
         "veredicto":          veredicto,
     }
 
@@ -258,26 +331,47 @@ def simular(modelo_id: str, specs: dict) -> dict:
 
 if __name__ == "__main__":
     perfiles = {
-        "Equipo débil  ": {"ram_gb": 4,  "tiene_gpu": False, "vram_gb": 0,  "uso_deseado": "conversación"},
-        "Equipo medio  ": {"ram_gb": 16, "tiene_gpu": True,  "vram_gb": 6,  "uso_deseado": "código"},
-        "Equipo potente": {"ram_gb": 64, "tiene_gpu": True,  "vram_gb": 48, "uso_deseado": "análisis"},
+        "Equipo débil (Windows)  ": {
+            "ram_gb": 4, "tiene_gpu": False, "vram_gb": 0,
+            "uso_deseado": "conversación", "sistema_operativo": "Windows",
+        },
+        "Equipo medio (Linux)    ": {
+            "ram_gb": 16, "tiene_gpu": True, "vram_gb": 8,
+            "uso_deseado": "código", "sistema_operativo": "Linux",
+        },
+        "MacBook Pro M2 (16 GB)  ": {
+            "ram_gb": 16, "tiene_gpu": False, "vram_gb": 0,
+            "uso_deseado": "análisis", "sistema_operativo": "macOS",
+        },
+        "MacBook Pro M3 Max (36 GB)": {
+            "ram_gb": 36, "tiene_gpu": False, "vram_gb": 0,
+            "uso_deseado": "código complejo", "sistema_operativo": "macOS",
+        },
+        "Equipo potente (Windows) ": {
+            "ram_gb": 64, "tiene_gpu": True, "vram_gb": 48,
+            "uso_deseado": "análisis", "sistema_operativo": "Windows",
+        },
     }
-    modelos_prueba = ["phi3-mini", "mistral-7b", "llama3-70b"]
+    modelos_prueba = ["phi3-mini", "mistral-7b", "llama3-8b", "llama3-70b"]
 
     for nombre_perfil, specs in perfiles.items():
-        print(f"\n{'='*65}")
-        print(f"  Perfil: {nombre_perfil} | RAM {specs['ram_gb']}GB | GPU: {specs['tiene_gpu']} ({specs['vram_gb']}GB VRAM)")
-        print(f"{'='*65}")
+        print(f"\n{'='*80}")
+        so = specs['sistema_operativo']
+        ram = specs['ram_gb']
+        gpu_info = f"Apple Silicon ({ram} GB unificada)" if so == "macOS" else f"GPU discreta: {specs['tiene_gpu']} ({specs['vram_gb']} GB VRAM)"
+        print(f"  Perfil: {nombre_perfil} | RAM: {ram} GB | {gpu_info}")
+        print(f"{'='*80}")
         for modelo_id in modelos_prueba:
             try:
                 r = simular(modelo_id, specs)
                 print(
-                    f"  {modelo_id:<15} | {r['modo_ejecucion']:<10} | "
+                    f"  {modelo_id:<15} | {r['modo_ejecucion']:<22} | "
                     f"{r['tokens_por_segundo']:>6.1f} tok/s | "
                     f"RAM {r['uso_ram_pct']:>5.1f}% | "
                     f"CPU {r['uso_cpu_pct']:>5.1f}% | "
                     f"Carga {r['tiempo_carga_seg']:>5.1f}s | "
                     f"{r['temperatura_c']:>4.0f}°C | "
+                    f"ctx {r['contexto_max_k']}k | "
                     f"{r['veredicto']['titulo']}"
                 )
             except KeyError as e:
