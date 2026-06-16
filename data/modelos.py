@@ -83,4 +83,4 @@ def get_modelo(nombre: str) -> dict:
 
 def get_todos_los_modelos() -> dict[str, dict]:
     """Retorna el diccionario completo de modelos (solo lectura conceptual)."""
-    return MODELOS
+    return MODELOS  
