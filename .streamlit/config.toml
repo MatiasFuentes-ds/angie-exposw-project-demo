@@ -1,0 +1,32 @@
+# .streamlit/config.toml
+# Tema visual profesional para ANGIE — Dark Mode forzado.
+# Coloca este archivo en la carpeta .streamlit/ en la raíz del proyecto.
+
+[theme]
+# Modo oscuro forzado: elimina el blanco por defecto de Streamlit
+base                = "dark"
+
+# Azul índigo tecnológico — reemplaza el rojo por defecto de Streamlit.
+# Se usa en botones primarios, sliders, checkboxes y focus rings.
+primaryColor        = "#6366f1"
+
+# Fondo principal de la aplicación
+backgroundColor     = "#0f1117"
+
+# Fondo de los widgets, inputs y paneles secundarios (sutilmente más claro)
+# Crea profundidad visual entre el canvas y los componentes
+secondaryBackgroundColor = "#1a1d27"
+
+# Color del texto principal — blanco suave para no cansar la vista
+textColor           = "#e2e8f0"
+
+# Tipografía — "sans serif" da un look más técnico y moderno
+font                = "sans serif"
+
+[server]
+# Abre el navegador automáticamente al ejecutar streamlit run
+headless            = false
+
+[browser]
+# Desactiva la telemetría de uso
+gatherUsageStats    = false
