@@ -23,10 +23,6 @@ textColor           = "#e2e8f0"
 # Tipografía — "sans serif" da un look más técnico y moderno
 font                = "sans serif"
 
-[server]
-# Abre el navegador automáticamente al ejecutar streamlit run
-headless            = false
-
 [browser]
 # Desactiva la telemetría de uso
 gatherUsageStats    = false
